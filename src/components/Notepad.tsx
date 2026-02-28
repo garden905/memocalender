@@ -10,12 +10,15 @@ import { ja } from 'date-fns/locale';
 export default function Notepad() {
   const [text, setText] = useState('');
   const [detectedDates, setDetectedDates] = useState<chrono.ParsedResult[]>([]);
+  // Store ambiguous numbers grouped if they appear close to each other
+  const [ambiguousGroups, setAmbiguousGroups] = useState<{ id: string, numbers: { text: string, index: number }[], sourceContext: string }[]>([]);
   const [addedEvents, setAddedEvents] = useState<{ id: string, title: string, text: string, date: Date }[]>([]);
 
   // Function to detect dates in text
   const detectDates = useCallback((currentText: string) => {
     if (!currentText.trim()) {
       setDetectedDates([]);
+      setAmbiguousGroups([]);
       return;
     }
 
@@ -24,12 +27,78 @@ export default function Notepad() {
 
     // Filter out dates that have already been converted to events for this specific text segment
     const newDates = results.filter(result => {
-      // Create a unique-ish ID based on the text matched and its position
-      const matchId = `${result.text}-${result.index}`;
+      const matchId = `date-${result.text}-${result.index}`;
       return !addedEvents.some(event => event.id === matchId);
     });
 
     setDetectedDates(newDates);
+
+    // Detect ambiguous numbers like "5", "12" that aren't parsed by chrono
+    const numberMatches = Array.from(currentText.matchAll(/(?<!\d)(\d{1,2})(?!\d)/g));
+    const validAmbiguous = numberMatches.filter(match => {
+      const numText = match[0];
+      const index = match.index!;
+      const matchId = `ambiguous-${numText}-${index}`;
+
+      if (addedEvents.some(event => event.id === matchId)) return false;
+      if (addedEvents.some(event => event.id.startsWith('group') && event.id.includes(matchId))) return false;
+
+      const overlaps = results.some(r => {
+        const rStart = r.index;
+        const rEnd = r.index + r.text.length;
+        const mStart = index;
+        const mEnd = index + numText.length;
+        return mStart < rEnd && mEnd > rStart;
+      });
+      return !overlaps;
+    }).map(match => ({
+      text: match[0],
+      index: match.index!
+    }));
+
+    // Group close numbers (e.g. "15, 16 遠足")
+    const groups: { id: string, numbers: { text: string, index: number }[], sourceContext: string }[] = [];
+    let currentGroup: { text: string, index: number }[] = [];
+
+    for (let i = 0; i < validAmbiguous.length; i++) {
+      const curr = validAmbiguous[i];
+      if (currentGroup.length === 0) {
+        currentGroup.push(curr);
+      } else {
+        const prev = currentGroup[currentGroup.length - 1];
+        const textBetween = currentText.substring(prev.index + prev.text.length, curr.index);
+        // If the text between the numbers is just spaces, commas, dots, or basic connectors, group them
+        if (/^[\s,、と・&.]+$/.test(textBetween)) {
+          currentGroup.push(curr);
+        } else {
+          // Find minimal context string to display for the previous group
+          const firstInPrevGroup = currentGroup[0];
+          const lastInPrevGroup = currentGroup[currentGroup.length - 1];
+          const contextStr = currentText.substring(firstInPrevGroup.index, lastInPrevGroup.index + lastInPrevGroup.text.length);
+
+          groups.push({
+            id: `group-${currentGroup.map(n => n.index).join('-')}`,
+            numbers: [...currentGroup],
+            sourceContext: contextStr
+          });
+          currentGroup = [curr];
+        }
+      }
+    }
+    if (currentGroup.length > 0) {
+      // Find minimal context string to display for the last group
+      const first = currentGroup[0];
+      const last = currentGroup[currentGroup.length - 1];
+      const contextStr = currentText.substring(first.index, last.index + last.text.length);
+
+      groups.push({
+        id: `group-${currentGroup.map(n => n.index).join('-')}`,
+        numbers: [...currentGroup],
+        sourceContext: contextStr
+      });
+    }
+
+    setAmbiguousGroups(groups);
   }, [addedEvents]);
 
   // Debounce the text detection slightly
@@ -40,26 +109,26 @@ export default function Notepad() {
     return () => clearTimeout(timeoutId);
   }, [text, detectDates]);
 
-  const handleAddEvent = (result: chrono.ParsedResult) => {
-    const matchId = `${result.text}-${result.index}`;
-    // Simple event extraction: take the sentence or line containing the date as title
+  const extractTitleAndAddEvent = (matchId: string, startDate: Date, sourceText: string) => {
     const lines = text.split('\n');
     let title = "予定";
     for (const line of lines) {
-      if (line.includes(result.text)) {
-        // Remove the date text from the title if possible, or just use the line
-        title = line.replace(result.text, '').trim() || "新しい予定";
+      if (line.includes(sourceText)) {
+        title = line.replace(sourceText, '').trim();
+        // Remove trailing or leading particles
+        title = title.replace(/^(に|から|まで|の|は|が|へ|で|と|、|。|\s)+/, '');
+        title = title.replace(/(に|から|まで|の|は|が|へ|で|と|、|。|\s)+$/, '');
+        title = title || "新しい予定";
         break;
       }
     }
 
-    const startDate = result.start.date();
     const endDate = addHours(startDate, 1); // Default to 1 hour event
 
     const newEvent = {
       id: matchId,
       title,
-      text: result.text,
+      text: sourceText,
       date: startDate
     };
 
@@ -70,7 +139,7 @@ export default function Notepad() {
       start: [startDate.getFullYear(), startDate.getMonth() + 1, startDate.getDate(), startDate.getHours(), startDate.getMinutes()],
       end: [endDate.getFullYear(), endDate.getMonth() + 1, endDate.getDate(), endDate.getHours(), endDate.getMinutes()],
       title: title,
-      description: `MemoCalendarから追加された予定\n\n検出元テキスト: ${result.text}`,
+      description: `MemoCalendarから追加された予定\n\n検出元テキスト: ${sourceText}`,
       status: 'CONFIRMED',
       busyStatus: 'BUSY'
     };
@@ -93,9 +162,39 @@ export default function Notepad() {
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
     });
+  };
 
-    // Remove the handled date from detection list
+  const handleAddEvent = (result: chrono.ParsedResult) => {
+    const matchId = `date-${result.text}-${result.index}`;
+    extractTitleAndAddEvent(matchId, result.start.date(), result.text);
     setDetectedDates(prev => prev.filter(d => d.index !== result.index));
+  };
+
+  const handleResolveAmbiguousGroup = (group: { id: string, numbers: { text: string, index: number }[], sourceContext: string }, type: 'month' | 'day' | 'hour') => {
+
+    group.numbers.forEach(item => {
+      let startDate = new Date();
+      const val = parseInt(item.text, 10);
+      // let dateText = item.text; // This was for individual display, not needed for event creation
+
+      if (type === 'month') {
+        startDate.setMonth(val - 1);
+        // dateText += '月';
+      } else if (type === 'day') {
+        startDate.setDate(val);
+        // dateText += '日';
+      } else if (type === 'hour') {
+        startDate.setHours(val, 0, 0, 0);
+        // dateText += '時';
+      }
+
+      // We use the whole group context to find the relevant line/title,
+      // but store the specific date text in the event.
+      const eventMatchId = `${group.id}-ambiguous-${item.text}-${item.index}`;
+      extractTitleAndAddEvent(eventMatchId, startDate, group.sourceContext); // Pass group.sourceContext for title extraction
+    });
+
+    setAmbiguousGroups(prev => prev.filter(g => g.id !== group.id));
   };
 
   const removeEvent = (id: string) => {
@@ -126,9 +225,11 @@ export default function Notepad() {
             style={{ fontSize: '1.05rem' }}
           />
 
-          {/* Suggestions Popover */}
-          {detectedDates.length > 0 && (
+          {/* Suggestions Popover for detected dates */}
+          {(detectedDates.length > 0 || ambiguousGroups.length > 0) && (
             <div className="absolute bottom-4 left-0 right-0 px-6 flex flex-col gap-3 animate-in fade-in slide-in-from-bottom-5 duration-300">
+
+              {/* Normal detected dates */}
               {detectedDates.map((result, idx) => (
                 <div
                   key={idx}
@@ -147,6 +248,34 @@ export default function Notepad() {
                     <CalendarPlus className="w-4 h-4" />
                     カレンダーに追加
                   </button>
+                </div>
+              ))}
+
+              {/* Ambiguous Number Suggestions (Groups) */}
+              {ambiguousGroups.map((group) => (
+                <div
+                  key={group.id}
+                  className="bg-indigo-600 shadow-xl shadow-indigo-500/20 text-white p-4 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4 border border-indigo-400/30"
+                >
+                  <div className="flex flex-col">
+                    <span className="text-sm text-indigo-200 font-medium">
+                      「{group.sourceContext}」はいつの予定ですか？
+                    </span>
+                    {group.numbers.length > 1 && (
+                      <span className="text-xs text-indigo-300">※複数まとめて追加されます</span>
+                    )}
+                  </div>
+                  <div className="flex gap-2 shrink-0">
+                    <button onClick={() => handleResolveAmbiguousGroup(group, 'day')} className="bg-white text-indigo-600 hover:bg-indigo-50 px-3 py-1.5 rounded-lg text-sm font-semibold transition-colors shadow-sm">
+                      {group.numbers.length > 1 ? '日' : `${group.sourceContext}日`}
+                    </button>
+                    <button onClick={() => handleResolveAmbiguousGroup(group, 'hour')} className="bg-white text-indigo-600 hover:bg-indigo-50 px-3 py-1.5 rounded-lg text-sm font-semibold transition-colors shadow-sm">
+                      {group.numbers.length > 1 ? '時' : `${group.sourceContext}時`}
+                    </button>
+                    <button onClick={() => handleResolveAmbiguousGroup(group, 'month')} className="bg-indigo-500 hover:bg-indigo-400 px-3 py-1.5 rounded-lg text-sm font-semibold transition-colors">
+                      {group.numbers.length > 1 ? '月' : `${group.sourceContext}月`}
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>
