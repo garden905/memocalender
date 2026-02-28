@@ -34,10 +34,12 @@ export default function Notepad() {
     setDetectedDates(newDates);
 
     // Detect ambiguous numbers like "5", "12" that aren't parsed by chrono
-    const numberMatches = Array.from(currentText.matchAll(/(?<!\d)(\d{1,2})(?!\d)/g));
+    // Using a Safari-compatible Regex without look-behinds `(?<!...)`
+    const numberMatches = Array.from(currentText.matchAll(/(?:^|[^\d])(\d{1,2})(?=[^\d]|$)/g));
     const validAmbiguous = numberMatches.filter(match => {
-      const numText = match[0];
-      const index = match.index!;
+      const numText = match[1]; // Capture group 1 has the digits
+      const matchFullText = match[0];
+      const index = match.index! + matchFullText.lastIndexOf(numText);
       const matchId = `ambiguous-${numText}-${index}`;
 
       if (addedEvents.some(event => event.id === matchId)) return false;
@@ -51,10 +53,15 @@ export default function Notepad() {
         return mStart < rEnd && mEnd > rStart;
       });
       return !overlaps;
-    }).map(match => ({
-      text: match[0],
-      index: match.index!
-    }));
+    }).map(match => {
+      const numText = match[1];
+      const matchFullText = match[0];
+      const index = match.index! + matchFullText.lastIndexOf(numText);
+      return {
+        text: numText,
+        index: index
+      };
+    });
 
     // Group close numbers (e.g. "15, 16 遠足")
     const groups: { id: string, numbers: { text: string, index: number }[], sourceContext: string }[] = [];
